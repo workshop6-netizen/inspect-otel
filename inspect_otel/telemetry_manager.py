@@ -1,0 +1,109 @@
+"""Fan-out manager that delegates to one or more telemetry backends."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .otel_backend import OpenTelemetryBackend
+
+
+class TelemetryManager:
+    """Delegates telemetry calls to a list of :class:`OpenTelemetryBackend` instances.
+
+    Using a list of backends allows multiple exporters to receive the same
+    data simultaneously (e.g. both Phoenix and Jaeger).
+    """
+
+    def __init__(self, backends: list[OpenTelemetryBackend]) -> None:
+        self._backends = backends
+
+    def start_run(self, run_id: str, metadata: dict[str, Any]) -> None:
+        """Signal the start of an eval run to all backends."""
+        for backend in self._backends:
+            backend.start_run(run_id, metadata)
+
+    def start_sample(
+        self, run_id: str, sample_id: str, metadata: dict[str, Any]
+    ) -> None:
+        """Open a sample span in all backends."""
+        for backend in self._backends:
+            backend.start_sample(run_id, sample_id, metadata)
+
+    def log_model_call(
+        self,
+        run_id: str,
+        eval_id: str,
+        model_name: str,
+        input_tokens: int,
+        output_tokens: int,
+        total_tokens: int,
+        latency_ms: float,
+        retries: int,
+    ) -> None:
+        """Emit an ``llm.call`` span to all backends."""
+        for backend in self._backends:
+            backend.log_model_call(
+                run_id=run_id,
+                eval_id=eval_id,
+                model_name=model_name,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                latency_ms=latency_ms,
+                retries=retries,
+            )
+
+    def log_tool_event(
+        self,
+        run_id: str,
+        eval_id: str,
+        sample_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> None:
+        """Emit a ``tool.call`` span to all backends."""
+        for backend in self._backends:
+            backend.log_tool_event(
+                run_id=run_id,
+                eval_id=eval_id,
+                sample_id=sample_id,
+                tool_name=tool_name,
+                tool_input=tool_input,
+            )
+
+    def log_sample(
+        self,
+        run_id: str,
+        sample_id: str,
+        inputs: dict[str, Any],
+        outputs: dict[str, Any],
+        expected: dict[str, Any],
+        scores: dict[str, float | None],
+        metadata: dict[str, Any],
+    ) -> None:
+        """Log one evaluated sample to all backends."""
+        for backend in self._backends:
+            backend.log_sample(
+                run_id=run_id,
+                sample_id=sample_id,
+                inputs=inputs,
+                outputs=outputs,
+                expected=expected,
+                scores=scores,
+                metadata=metadata,
+            )
+
+    def end_run(self, run_id: str) -> None:
+        """Signal the end of an eval run to all backends."""
+        for backend in self._backends:
+            backend.end_run(run_id)
+
+    def flush(self) -> None:
+        """Flush all pending spans in all backends."""
+        for backend in self._backends:
+            backend.flush()
+
+    def shutdown(self) -> None:
+        """Flush and shut down all backends."""
+        for backend in self._backends:
+            backend.shutdown()

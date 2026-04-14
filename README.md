@@ -8,17 +8,21 @@ inspect-otel provides a standardised telemetry layer for LLM evaluation systems 
 
 - Arize Phoenix (`http://localhost:6006/v1/traces`)
 - Grafana / Jaeger / Tempo
-- LangSmith (via a custom OTLP exporter)
+- Any OTLP/HTTP-compatible collector
 
 ## Features
 
 - OpenTelemetry-native tracing via the `inspect_ai.hooks.Hooks` interface
-- Per-task root spans and per-sample child spans, fully nested
+- Per-task root spans, per-sample child spans, **per-LLM-call and per-tool-call grandchild spans**, fully nested
+- `contextvars`-based span context propagation — concurrent samples do not bleed context into one another
+- Multiple scorer support — every scorer score is emitted as a separate `eval.score.<scorer>` attribute
+- `eval.dataset.version` and `eval.experiment_id` span attributes for experiment tracking
+- Graceful shutdown via `on_eval_set_end` and `provider.shutdown()`
 - Decorators for tracing LLM and tool calls in standalone code
 - Sampling support (TraceIdRatioBased) for large-scale evals
 - Async batching (BatchSpanProcessor) or synchronous mode
 - Failure-only logging mode (skip successfully-scored samples)
-- 100 % test coverage
+- 100% test coverage (136 tests)
 
 ---
 
@@ -38,10 +42,10 @@ telemetry:
   otlp_endpoint: http://localhost:6006/v1/traces
 
   sampling:
-    rate: 0.2
+    rate: 1.0
 
   logging:
-    failure_only: true
+    failure_only: false
 
   async: true
 ```
@@ -99,23 +103,58 @@ Both decorators record `llm.model` / `tool.name`, latency, exceptions, and set a
 ## Span Hierarchy
 
 ```
-inspect.run          <- one per task  (on_task_start / on_task_end)
-  +-- inspect.sample <- one per sample (on_sample_end)
+inspect.run              <- one per task  (on_task_start / on_task_end)
+  +-- inspect.sample     <- one per sample (on_sample_start ... on_sample_end)
+        +-- llm.call     <- one per model API call (on_model_usage)
+        +-- tool.call    <- one per tool invocation (on_sample_event / ToolEvent)
 ```
+
+Span context is propagated via `contextvars.ContextVar` so that concurrent samples running in parallel asyncio tasks never mix their parent references.
 
 ### Key Span Attributes
 
-| Span | Attribute | Source |
-|---|---|---|
-| `inspect.run` | `eval.run_id` | `TaskStart.run_id` |
-| `inspect.run` | `eval.name` | `EvalSpec.task` |
-| `inspect.run` | `llm.model` | `EvalSpec.model` |
-| `inspect.run` | `eval.dataset` | `EvalSpec.dataset.name` |
-| `inspect.run` | `eval.experiment_id` | `EvalSpec.metadata["experiment_id"]` |
-| `inspect.sample` | `eval.sample_id` | `EvalSample.id` |
-| `inspect.sample` | `eval.score` | `Score.as_float()` |
-| `inspect.sample` | `llm.latency_ms` | `EvalSample.total_time * 1000` |
-| `inspect.sample` | `llm.model` | first key of `EvalSample.model_usage` |
+#### `inspect.run`
+
+| Attribute | Source |
+|---|---|
+| `eval.run_id` | `TaskStart.run_id` |
+| `eval.name` | `EvalSpec.task` |
+| `eval.type` | always `"benchmark"` |
+| `llm.model` | `EvalSpec.model` |
+| `eval.dataset` | `EvalSpec.dataset.name` |
+| `eval.dataset.version` | `EvalSpec.dataset.version` |
+| `eval.experiment_id` | `EvalSpec.metadata["experiment_id"]` |
+
+#### `inspect.sample`
+
+| Attribute | Source |
+|---|---|
+| `eval.sample_id` | `EvalSample.id` |
+| `eval.score` | first non-None score (legacy convenience key) |
+| `eval.score.<scorer>` | per-scorer value from `EvalSample.scores` |
+| `llm.latency_ms` | `EvalSample.total_time * 1000` |
+| `llm.model` | first key of `EvalSample.model_usage` |
+| `eval.input.*` | stringified inputs |
+| `eval.output.*` | stringified outputs |
+| `eval.expected.*` | stringified expected values |
+
+#### `llm.call`
+
+| Attribute | Source |
+|---|---|
+| `llm.model` | `ModelUsageData.model_name` |
+| `llm.input_tokens` | `ModelUsage.input_tokens` |
+| `llm.output_tokens` | `ModelUsage.output_tokens` |
+| `llm.total_tokens` | `ModelUsage.total_tokens` |
+| `llm.latency_ms` | `ModelUsageData.call_duration * 1000` |
+| `llm.retries` | `ModelUsageData.retries` (only when > 0) |
+
+#### `tool.call`
+
+| Attribute | Source |
+|---|---|
+| `tool.name` | `ToolEvent.function` |
+| `tool.input.<arg>` | `ToolEvent.arguments` (each key-value pair) |
 
 ---
 
@@ -130,9 +169,32 @@ telemetry:
     rate: float               # 0.0-1.0, default 1.0
 
   logging:
-    failure_only: bool        # default false
+    failure_only: bool        # default false -- only log failed samples
 
   async: bool                 # true = BatchSpanProcessor (default)
+                              # false = SimpleSpanProcessor (blocks on each span)
+```
+
+---
+
+## Graceful Shutdown
+
+inspect-otel registers an `on_eval_set_end` hook that calls `manager.shutdown()`,
+which in turn calls `provider.shutdown()` on every backend. This flushes any
+buffered spans and cleanly terminates exporter connections at the end of the
+eval set -- no `atexit` handler registration required.
+
+---
+
+## Multiple Scorers
+
+When a sample has multiple scorers (e.g. both `accuracy` and `f1`), each score
+is emitted as a separate attribute:
+
+```
+eval.score.accuracy = 1.0
+eval.score.f1       = 0.87
+eval.score          = 1.0   # first non-None value, legacy key
 ```
 
 ---
@@ -144,7 +206,10 @@ pip install arize-phoenix
 python -m phoenix.server.main
 ```
 
-Set `otlp_endpoint: http://localhost:6006/v1/traces`.
+Set `otlp_endpoint: http://localhost:6006/v1/traces` and open
+`http://localhost:6006` in your browser.
+
+See [example.md](example.md) for a full walkthrough.
 
 ---
 
@@ -165,14 +230,3 @@ pip install build twine
 python -m build
 twine upload dist/*
 ```
-
----
-
-## Roadmap
-
-- [ ] LangSmith exporter adapter
-- [ ] Dataset sync / version diffing
-- [ ] CLI tooling
-- [ ] Streamlit dashboard
-- [ ] Embedding-based failure clustering
-- [ ] Regression detection across eval versions
