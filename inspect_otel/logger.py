@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from inspect_ai.hooks import (
@@ -36,6 +37,7 @@ class OpenTelemetryLogger(Hooks):
 
     def __init__(self, manager: TelemetryManager) -> None:
         self._manager = manager
+        self._current_invocation_params: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Hooks interface
@@ -61,6 +63,13 @@ class OpenTelemetryLogger(Hooks):
             experiment_id = spec.metadata.get("experiment_id")
             if experiment_id is not None:
                 metadata["eval.experiment_id"] = str(experiment_id)
+
+        # Extract GenerateConfig so Phoenix can render the Parameters panel.
+        config = getattr(spec, "config", None)
+        self._current_invocation_params = _extract_invocation_params(config)
+        if self._current_invocation_params:
+            metadata["llm.invocation_parameters"] = json.dumps(self._current_invocation_params)
+
         self._manager.start_run(data.eval_id, metadata)
 
     async def on_sample_start(self, data: SampleStart) -> None:  # type: ignore[override]
@@ -88,6 +97,7 @@ class OpenTelemetryLogger(Hooks):
             cache_read_tokens=usage.input_tokens_cache_read,
             cache_write_tokens=usage.input_tokens_cache_write,
             reasoning_tokens=usage.reasoning_tokens,
+            invocation_parameters=self._current_invocation_params,
         )
 
     async def on_model_cache_usage(self, data: ModelCacheUsageData) -> None:  # type: ignore[override]
@@ -100,7 +110,10 @@ class OpenTelemetryLogger(Hooks):
         )
 
     async def on_task_end(self, data: TaskEnd) -> None:  # type: ignore[override]
-        """Close the span and flush pending telemetry."""
+        """Add aggregate metrics to the run span, then close it and flush."""
+        log = getattr(data, "log", None)
+        if log is not None:
+            self._manager.log_run_summary(data.eval_id, log)
         self._manager.end_run(data.eval_id)
         self._manager.flush()
 
@@ -130,6 +143,16 @@ class OpenTelemetryLogger(Hooks):
         output_text = _extract_output_text(sample.output)
         finish_reason = _extract_finish_reason(sample.output)
         messages = _extract_messages(sample.messages)
+        sample_token_usage = _aggregate_sample_tokens(sample.model_usage)
+
+        metadata_json: str | None = None
+        if sample.metadata:
+            try:
+                metadata_json = json.dumps(sample.metadata)
+            except (TypeError, ValueError):
+                metadata_json = str(sample.metadata)
+
+        error: str | None = getattr(sample, "error", None)
 
         self._manager.log_sample(
             run_id=data.eval_id,
@@ -146,6 +169,9 @@ class OpenTelemetryLogger(Hooks):
             },
             finish_reason=finish_reason,
             epoch=sample.epoch,
+            metadata_json=metadata_json,
+            token_usage=sample_token_usage,
+            error=error,
         )
 
     async def on_eval_set_end(self, data: EvalSetEnd) -> None:  # type: ignore[override]
@@ -204,3 +230,37 @@ def _extract_messages(chat_messages: list[Any]) -> list[dict[str, str]]:
             text = str(content) if content is not None else ""
         result.append({"role": str(msg.role), "content": text})
     return result
+
+
+def _extract_invocation_params(config: Any) -> dict[str, Any]:
+    """Extract GenerateConfig fields that Phoenix renders in its Parameters panel."""
+    if config is None:
+        return {}
+    params: dict[str, Any] = {}
+    for field in (
+        "temperature", "max_tokens", "top_p", "top_k", "seed",
+        "frequency_penalty", "presence_penalty", "num_choices",
+    ):
+        value = getattr(config, field, None)
+        if value is not None:
+            params[field] = value
+    stop_seqs = getattr(config, "stop_seqs", None)
+    if stop_seqs:
+        params["stop_seqs"] = stop_seqs
+    return params
+
+
+def _aggregate_sample_tokens(model_usage: Any) -> dict[str, int]:
+    """Sum token counts across all models used within one sample."""
+    if not model_usage:
+        return {}
+    total_input = total_output = total_tokens = 0
+    for usage in model_usage.values():
+        total_input += getattr(usage, "input_tokens", 0) or 0
+        total_output += getattr(usage, "output_tokens", 0) or 0
+        total_tokens += getattr(usage, "total_tokens", 0) or 0
+    return {
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "total_tokens": total_tokens,
+    }

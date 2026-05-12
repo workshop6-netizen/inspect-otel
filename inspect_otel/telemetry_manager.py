@@ -39,6 +39,7 @@ class TelemetryManager:
         cache_read_tokens: int | None = None,
         cache_write_tokens: int | None = None,
         reasoning_tokens: int | None = None,
+        invocation_parameters: dict[str, Any] | None = None,
     ) -> None:
         """Emit an ``llm.call`` span to all backends."""
         for backend in self._backends:
@@ -51,6 +52,7 @@ class TelemetryManager:
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 reasoning_tokens=reasoning_tokens,
+                invocation_parameters=invocation_parameters,
             )
 
     def log_model_cache_call(
@@ -85,6 +87,11 @@ class TelemetryManager:
                 tool_input=tool_input,
             )
 
+    def log_run_summary(self, run_id: str, log: Any) -> None:
+        """Write aggregate metrics from TaskEnd.log to the run span in all backends."""
+        for backend in self._backends:
+            backend.log_run_summary(run_id, log)
+
     def log_sample(
         self,
         run_id: str,
@@ -98,6 +105,9 @@ class TelemetryManager:
         metadata: dict[str, Any],
         finish_reason: str | None = None,
         epoch: int | None = None,
+        metadata_json: str | None = None,
+        token_usage: dict[str, int] | None = None,
+        error: str | None = None,
     ) -> None:
         """Log one evaluated sample to all backends."""
         for backend in self._backends:
@@ -113,6 +123,9 @@ class TelemetryManager:
                 metadata=metadata,
                 finish_reason=finish_reason,
                 epoch=epoch,
+                metadata_json=metadata_json,
+                token_usage=token_usage,
+                error=error,
             )
 
     def end_run(self, run_id: str) -> None:

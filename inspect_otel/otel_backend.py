@@ -134,6 +134,7 @@ class OpenTelemetryBackend:
         cache_read_tokens: int | None = None,
         cache_write_tokens: int | None = None,
         reasoning_tokens: int | None = None,
+        invocation_parameters: dict[str, Any] | None = None,
     ) -> None:
         """Emit an ``llm.call`` child span with token counts and latency.
 
@@ -157,6 +158,8 @@ class OpenTelemetryBackend:
                 span.set_attribute(_LLM_CACHE_WRITE_TOKENS, cache_write_tokens)
             if reasoning_tokens is not None:
                 span.set_attribute(_LLM_REASONING_TOKENS, reasoning_tokens)
+            if invocation_parameters:
+                span.set_attribute("llm.invocation_parameters", json.dumps(invocation_parameters))
             span.set_status(StatusCode.OK)
 
     def log_model_cache_call(
@@ -212,6 +215,9 @@ class OpenTelemetryBackend:
         metadata: dict[str, Any],
         finish_reason: str | None = None,
         epoch: int | None = None,
+        metadata_json: str | None = None,
+        token_usage: dict[str, int] | None = None,
+        error: str | None = None,
     ) -> None:
         """Finalise and close the ``inspect.sample`` span opened by :meth:`start_sample`.
 
@@ -275,7 +281,26 @@ class OpenTelemetryBackend:
             if value is not None:
                 span.set_attribute(key, str(value))
 
-        if passed:
+        # Sample-level token aggregation (OpenInference attributes on CHAIN span).
+        _token_key_map = {
+            "input_tokens": _LLM_PROMPT_TOKENS,
+            "output_tokens": _LLM_COMPLETION_TOKENS,
+            "total_tokens": _LLM_TOTAL_TOKENS,
+        }
+        for field, attr in _token_key_map.items():
+            val = (token_usage or {}).get(field)
+            if val is not None:
+                span.set_attribute(attr, int(val))
+
+        # Sample metadata JSON — rendered in Phoenix's Metadata panel.
+        if metadata_json is not None:
+            span.set_attribute("metadata", metadata_json)
+
+        # Status: error overrides pass/fail scoring.
+        if error:
+            span.set_attribute("eval.error", str(error))
+            span.set_status(StatusCode.ERROR, str(error))
+        elif passed:
             span.set_status(StatusCode.OK)
         elif score is not None:
             span.set_status(StatusCode.ERROR, "Sample did not pass")
@@ -295,6 +320,50 @@ class OpenTelemetryBackend:
             )
 
         span.end()
+
+    def log_run_summary(self, run_id: str, log: Any) -> None:
+        """Write aggregate metrics from TaskEnd.log onto the open run span."""
+        with self._lock:
+            span = self._run_spans.get(run_id)
+        if span is None:
+            return
+
+        results = getattr(log, "results", None)
+        if results is not None:
+            total = getattr(results, "total_samples", None)
+            completed = getattr(results, "completed_samples", None)
+            if total is not None:
+                span.set_attribute("eval.total_samples", int(total))
+            if completed is not None:
+                span.set_attribute("eval.completed_samples", int(completed))
+
+            summary_parts: list[str] = []
+            for eval_score in (getattr(results, "scores", None) or []):
+                scorer_name = getattr(eval_score, "name", None) or getattr(eval_score, "scorer", "score")
+                for metric_name, metric_obj in (getattr(eval_score, "metrics", None) or {}).items():
+                    value = getattr(metric_obj, "value", None)
+                    if value is not None:
+                        attr = f"eval.metrics.{scorer_name}.{metric_name}"
+                        span.set_attribute(attr, float(value))
+                        summary_parts.append(f"{scorer_name}/{metric_name}: {value:.3f}")
+
+            if summary_parts:
+                prefix = f"{completed}/{total} samples. " if (completed is not None and total is not None) else ""
+                span.set_attribute("output.value", prefix + ", ".join(summary_parts))
+
+        stats = getattr(log, "stats", None)
+        if stats is not None:
+            for model, usage in (getattr(stats, "model_usage", None) or {}).items():
+                safe_model = model.replace("/", "_").replace("-", "_").replace(".", "_")
+                prefix = f"eval.total_usage.{safe_model}"
+                for field, attr_suffix in (
+                    ("input_tokens", "input_tokens"),
+                    ("output_tokens", "output_tokens"),
+                    ("total_tokens", "total_tokens"),
+                ):
+                    val = getattr(usage, field, None)
+                    if val is not None:
+                        span.set_attribute(f"{prefix}.{attr_suffix}", int(val))
 
     def end_run(self, run_id: str) -> None:
         """Close the root span for the given run."""
