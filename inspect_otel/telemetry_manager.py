@@ -31,26 +31,20 @@ class TelemetryManager:
 
     def log_model_call(
         self,
-        run_id: str,
-        eval_id: str,
         model_name: str,
         input_tokens: int,
         output_tokens: int,
         total_tokens: int,
         latency_ms: float,
-        retries: int,
     ) -> None:
         """Emit an ``llm.call`` span to all backends."""
         for backend in self._backends:
             backend.log_model_call(
-                run_id=run_id,
-                eval_id=eval_id,
                 model_name=model_name,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 latency_ms=latency_ms,
-                retries=retries,
             )
 
     def log_tool_event(

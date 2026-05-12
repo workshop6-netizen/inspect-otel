@@ -70,18 +70,13 @@ class OpenTelemetryLogger(Hooks):
 
     async def on_model_usage(self, data: ModelUsageData) -> None:  # type: ignore[override]
         """Emit an ``llm.call`` child span with token counts and latency."""
-        if data.eval_id is None:
-            return
         usage = data.usage
         self._manager.log_model_call(
-            run_id=data.run_id or data.eval_id,
-            eval_id=data.eval_id,
             model_name=data.model_name,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
             latency_ms=data.call_duration * 1000.0,
-            retries=data.retries,
         )
 
     async def on_task_end(self, data: TaskEnd) -> None:  # type: ignore[override]
@@ -110,7 +105,7 @@ class OpenTelemetryLogger(Hooks):
 
         self._manager.log_sample(
             run_id=data.eval_id,
-            sample_id=str(sample.id),
+            sample_id=data.sample_id,
             inputs={"input": str(sample.input)},
             outputs={"output": str(sample.output)},
             expected={"target": str(sample.target)},

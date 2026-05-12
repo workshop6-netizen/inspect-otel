@@ -119,23 +119,20 @@ class OpenTelemetryBackend:
 
     def log_model_call(
         self,
-        run_id: str,
-        eval_id: str,
         model_name: str,
         input_tokens: int,
         output_tokens: int,
         total_tokens: int,
         latency_ms: float,
-        retries: int,
     ) -> None:
-        """Emit an ``llm.call`` child span with token counts and latency."""
+        """Emit an ``llm.call`` child span with token counts and latency.
+
+        Uses the active OTel context (set by start_sample) so the span is
+        automatically nested under the current sample span.
+        """
         parent_ctx = _current_otel_ctx.get()
         if parent_ctx is None:
-            with self._lock:
-                run_span = self._run_spans.get(eval_id)
-            if run_span is None:
-                return
-            parent_ctx = trace.set_span_in_context(run_span)
+            return
 
         with self._tracer.start_as_current_span("llm.call", context=parent_ctx) as span:
             span.set_attribute(_SPAN_KIND, "LLM")
@@ -144,8 +141,6 @@ class OpenTelemetryBackend:
             span.set_attribute(_LLM_COMPLETION_TOKENS, output_tokens)
             span.set_attribute(_LLM_TOTAL_TOKENS, total_tokens)
             span.set_attribute("llm.latency_ms", latency_ms)
-            if retries:
-                span.set_attribute("llm.retries", retries)
             span.set_status(StatusCode.OK)
 
     def log_tool_event(
