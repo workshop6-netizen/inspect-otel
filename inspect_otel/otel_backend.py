@@ -23,10 +23,15 @@ _SERVICE_NAME_ATTR = "service.name"
 _SPAN_KIND = "openinference.span.kind"
 _INPUT_VALUE = "input.value"
 _OUTPUT_VALUE = "output.value"
+_SESSION_ID = "session.id"
 _LLM_MODEL_NAME = "llm.model_name"
 _LLM_PROMPT_TOKENS = "llm.token_count.prompt"
 _LLM_COMPLETION_TOKENS = "llm.token_count.completion"
 _LLM_TOTAL_TOKENS = "llm.token_count.total"
+_LLM_CACHE_READ_TOKENS = "llm.token_count.prompt_details.cache_read"
+_LLM_CACHE_WRITE_TOKENS = "llm.token_count.prompt_details.cache_write"
+_LLM_REASONING_TOKENS = "llm.token_count.completion_details.reasoning"
+_LLM_FINISH_REASON = "llm.output_messages.0.message.finish_reason"
 
 # ContextVar that carries the current OTel context across async boundaries.
 # Each asyncio task (sample) runs in its own copy of the context, so setting
@@ -81,6 +86,7 @@ class OpenTelemetryBackend:
         """Open a root span for an eval run."""
         span = self._tracer.start_span("inspect.run")
         span.set_attribute(_SPAN_KIND, "CHAIN")
+        span.set_attribute(_SESSION_ID, run_id)
         for key, value in metadata.items():
             if value is not None:
                 span.set_attribute(key, str(value))
@@ -104,6 +110,7 @@ class OpenTelemetryBackend:
         parent_ctx = trace.set_span_in_context(run_span)
         span = self._tracer.start_span("inspect.sample", context=parent_ctx)
         span.set_attribute(_SPAN_KIND, "CHAIN")
+        span.set_attribute(_SESSION_ID, run_id)
         span.set_attribute("eval.sample_id", sample_id)
         for key, value in metadata.items():
             if value is not None:
@@ -124,6 +131,9 @@ class OpenTelemetryBackend:
         output_tokens: int,
         total_tokens: int,
         latency_ms: float,
+        cache_read_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
     ) -> None:
         """Emit an ``llm.call`` child span with token counts and latency.
 
@@ -141,6 +151,30 @@ class OpenTelemetryBackend:
             span.set_attribute(_LLM_COMPLETION_TOKENS, output_tokens)
             span.set_attribute(_LLM_TOTAL_TOKENS, total_tokens)
             span.set_attribute("llm.latency_ms", latency_ms)
+            if cache_read_tokens is not None:
+                span.set_attribute(_LLM_CACHE_READ_TOKENS, cache_read_tokens)
+            if cache_write_tokens is not None:
+                span.set_attribute(_LLM_CACHE_WRITE_TOKENS, cache_write_tokens)
+            if reasoning_tokens is not None:
+                span.set_attribute(_LLM_REASONING_TOKENS, reasoning_tokens)
+            span.set_status(StatusCode.OK)
+
+    def log_model_cache_call(
+        self,
+        model_name: str,
+        cache_read_tokens: int,
+        total_tokens: int,
+    ) -> None:
+        """Emit an ``llm.cache_hit`` child span for cache-served responses."""
+        parent_ctx = _current_otel_ctx.get()
+        if parent_ctx is None:
+            return
+
+        with self._tracer.start_as_current_span("llm.cache_hit", context=parent_ctx) as span:
+            span.set_attribute(_SPAN_KIND, "LLM")
+            span.set_attribute(_LLM_MODEL_NAME, model_name)
+            span.set_attribute(_LLM_CACHE_READ_TOKENS, cache_read_tokens)
+            span.set_attribute(_LLM_TOTAL_TOKENS, total_tokens)
             span.set_status(StatusCode.OK)
 
     def log_tool_event(
@@ -173,7 +207,11 @@ class OpenTelemetryBackend:
         outputs: dict[str, Any],
         expected: dict[str, Any],
         scores: dict[str, float | None],
+        score_details: dict[str, dict[str, Any]],
+        messages: list[dict[str, str]],
         metadata: dict[str, Any],
+        finish_reason: str | None = None,
+        epoch: int | None = None,
     ) -> None:
         """Finalise and close the ``inspect.sample`` span opened by :meth:`start_sample`.
 
@@ -202,9 +240,10 @@ class OpenTelemetryBackend:
             parent_ctx = trace.set_span_in_context(run_span)
             span = self._tracer.start_span("inspect.sample", context=parent_ctx)
             span.set_attribute(_SPAN_KIND, "CHAIN")
+            span.set_attribute(_SESSION_ID, run_id)
             span.set_attribute("eval.sample_id", str(sample_id))
 
-        # Phoenix renders input.value / output.value as the primary I/O display.
+        # Primary I/O text for Phoenix's span header.
         input_text = next(iter(inputs.values()), None)
         output_text = next(iter(outputs.values()), None)
         if input_text is not None:
@@ -212,7 +251,7 @@ class OpenTelemetryBackend:
         if output_text is not None:
             span.set_attribute(_OUTPUT_VALUE, str(output_text))
 
-        # Keep full dicts as structured attributes for completeness.
+        # Structured eval attributes.
         _set_prefixed_attributes(span, "eval.input", inputs)
         _set_prefixed_attributes(span, "eval.output", outputs)
         _set_prefixed_attributes(span, "eval.expected", expected)
@@ -223,6 +262,15 @@ class OpenTelemetryBackend:
         if score is not None:
             span.set_attribute("eval.score", float(score))
 
+        if epoch is not None:
+            span.set_attribute("eval.epoch", epoch)
+
+        if finish_reason:
+            span.set_attribute(_LLM_FINISH_REASON, finish_reason)
+
+        # Full conversation as LLM message attributes (Phoenix chat view).
+        _set_message_attributes(span, messages)
+
         for key, value in metadata.items():
             if value is not None:
                 span.set_attribute(key, str(value))
@@ -231,6 +279,20 @@ class OpenTelemetryBackend:
             span.set_status(StatusCode.OK)
         elif score is not None:
             span.set_status(StatusCode.ERROR, "Sample did not pass")
+
+        # EVALUATOR child spans — one per scorer, created before ending parent.
+        sample_ctx = trace.set_span_in_context(span)
+        for scorer_name, score_value in scores.items():
+            details = score_details.get(scorer_name, {})
+            self._emit_evaluator_span(
+                parent_ctx=sample_ctx,
+                scorer_name=scorer_name,
+                score_value=score_value,
+                label=details.get("label"),
+                explanation=details.get("explanation"),
+                answer=details.get("answer"),
+                input_text=input_text,
+            )
 
         span.end()
 
@@ -249,6 +311,42 @@ class OpenTelemetryBackend:
         """Flush and shut down the underlying :class:`TracerProvider`."""
         self._provider.shutdown()
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _emit_evaluator_span(
+        self,
+        parent_ctx: otel_context.Context,
+        scorer_name: str,
+        score_value: float | None,
+        label: str | None,
+        explanation: str | None,
+        answer: str | None,
+        input_text: str | None,
+    ) -> None:
+        """Emit an EVALUATOR child span for a single scorer result."""
+        with self._tracer.start_as_current_span(
+            f"eval.{scorer_name}", context=parent_ctx
+        ) as span:
+            span.set_attribute(_SPAN_KIND, "EVALUATOR")
+            span.set_attribute("eval.name", scorer_name)
+            if input_text is not None:
+                span.set_attribute(_INPUT_VALUE, input_text)
+            if score_value is not None:
+                span.set_attribute("eval.score", float(score_value))
+                span.set_attribute(_OUTPUT_VALUE, str(score_value))
+            if label is not None:
+                span.set_attribute("eval.label", label)
+            if explanation is not None:
+                span.set_attribute("eval.explanation", explanation)
+            if answer is not None:
+                span.set_attribute("eval.answer", answer)
+            if score_value is not None and score_value > 0:
+                span.set_status(StatusCode.OK)
+            elif score_value is not None:
+                span.set_status(StatusCode.ERROR, "Did not pass")
+
 
 # ------------------------------------------------------------------
 # Helpers
@@ -260,3 +358,35 @@ def _set_prefixed_attributes(
     for key, value in data.items():
         if value is not None:
             span.set_attribute(f"{prefix}.{key}", str(value))
+
+
+def _set_message_attributes(
+    span: trace.Span, messages: list[dict[str, str]]
+) -> None:
+    """Write conversation history using OpenInference flat-indexed message format.
+
+    Input messages (user/system) go to ``llm.input_messages.*``.
+    The final assistant message goes to ``llm.output_messages.*``.
+    """
+    if not messages:
+        return
+
+    # Split: last assistant message → output; everything else → input.
+    if messages[-1].get("role") == "assistant":
+        input_msgs = messages[:-1]
+        output_msgs = messages[-1:]
+    else:
+        input_msgs = messages
+        output_msgs = []
+
+    for i, msg in enumerate(input_msgs):
+        prefix = f"llm.input_messages.{i}.message"
+        span.set_attribute(f"{prefix}.role", msg.get("role", ""))
+        if msg.get("content"):
+            span.set_attribute(f"{prefix}.content", msg["content"])
+
+    for i, msg in enumerate(output_msgs):
+        prefix = f"llm.output_messages.{i}.message"
+        span.set_attribute(f"{prefix}.role", msg.get("role", ""))
+        if msg.get("content"):
+            span.set_attribute(f"{prefix}.content", msg["content"])

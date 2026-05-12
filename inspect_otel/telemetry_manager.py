@@ -36,6 +36,9 @@ class TelemetryManager:
         output_tokens: int,
         total_tokens: int,
         latency_ms: float,
+        cache_read_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
     ) -> None:
         """Emit an ``llm.call`` span to all backends."""
         for backend in self._backends:
@@ -45,6 +48,23 @@ class TelemetryManager:
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 latency_ms=latency_ms,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                reasoning_tokens=reasoning_tokens,
+            )
+
+    def log_model_cache_call(
+        self,
+        model_name: str,
+        cache_read_tokens: int,
+        total_tokens: int,
+    ) -> None:
+        """Emit an ``llm.cache_hit`` span to all backends."""
+        for backend in self._backends:
+            backend.log_model_cache_call(
+                model_name=model_name,
+                cache_read_tokens=cache_read_tokens,
+                total_tokens=total_tokens,
             )
 
     def log_tool_event(
@@ -73,7 +93,11 @@ class TelemetryManager:
         outputs: dict[str, Any],
         expected: dict[str, Any],
         scores: dict[str, float | None],
+        score_details: dict[str, dict[str, Any]],
+        messages: list[dict[str, str]],
         metadata: dict[str, Any],
+        finish_reason: str | None = None,
+        epoch: int | None = None,
     ) -> None:
         """Log one evaluated sample to all backends."""
         for backend in self._backends:
@@ -84,7 +108,11 @@ class TelemetryManager:
                 outputs=outputs,
                 expected=expected,
                 scores=scores,
+                score_details=score_details,
+                messages=messages,
                 metadata=metadata,
+                finish_reason=finish_reason,
+                epoch=epoch,
             )
 
     def end_run(self, run_id: str) -> None:

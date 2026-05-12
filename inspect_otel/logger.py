@@ -7,6 +7,7 @@ from typing import Any
 from inspect_ai.hooks import (
     EvalSetEnd,
     Hooks,
+    ModelCacheUsageData,
     ModelUsageData,
     SampleEnd,
     SampleStart,
@@ -27,10 +28,10 @@ class OpenTelemetryLogger(Hooks):
     Example (via setup_hooks)::
 
         from inspect_otel import setup_hooks
-        from inspect_ai import eval_set
+        from inspect_ai import eval
 
         setup_hooks(config_path="config.yaml")
-        eval_set(evals=[my_eval], model="gpt-4")
+        eval(tasks=[my_task()], model="gpt-4")
     """
 
     def __init__(self, manager: TelemetryManager) -> None:
@@ -54,6 +55,8 @@ class OpenTelemetryLogger(Hooks):
             metadata["eval.dataset"] = dataset.name
         if dataset and getattr(dataset, "version", None):
             metadata["eval.dataset.version"] = str(dataset.version)
+        if spec.tags:
+            metadata["eval.tags"] = ",".join(spec.tags)
         if spec.metadata:
             experiment_id = spec.metadata.get("experiment_id")
             if experiment_id is not None:
@@ -62,10 +65,15 @@ class OpenTelemetryLogger(Hooks):
 
     async def on_sample_start(self, data: SampleStart) -> None:  # type: ignore[override]
         """Open an ``inspect.sample`` span before the sample runs."""
+        summary = data.summary
+        metadata: dict[str, Any] = {
+            "eval.sample.id": str(summary.id),
+            "eval.epoch": summary.epoch,
+        }
         self._manager.start_sample(
             run_id=data.eval_id,
             sample_id=data.sample_id,
-            metadata={},
+            metadata=metadata,
         )
 
     async def on_model_usage(self, data: ModelUsageData) -> None:  # type: ignore[override]
@@ -77,6 +85,18 @@ class OpenTelemetryLogger(Hooks):
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
             latency_ms=data.call_duration * 1000.0,
+            cache_read_tokens=usage.input_tokens_cache_read,
+            cache_write_tokens=usage.input_tokens_cache_write,
+            reasoning_tokens=usage.reasoning_tokens,
+        )
+
+    async def on_model_cache_usage(self, data: ModelCacheUsageData) -> None:  # type: ignore[override]
+        """Emit an ``llm.cache_hit`` span when a cached response is served."""
+        usage = data.usage
+        self._manager.log_model_cache_call(
+            model_name=data.model_name,
+            cache_read_tokens=usage.input_tokens_cache_read or usage.input_tokens,
+            total_tokens=usage.total_tokens,
         )
 
     async def on_task_end(self, data: TaskEnd) -> None:  # type: ignore[override]
@@ -88,9 +108,16 @@ class OpenTelemetryLogger(Hooks):
         """Emit a child span with per-sample telemetry."""
         sample = data.sample
 
+        # Numeric scores and per-scorer detail (label, explanation, answer).
         scores: dict[str, float | None] = {}
+        score_details: dict[str, dict[str, Any]] = {}
         for scorer_name, score_obj in (sample.scores or {}).items():
             scores[scorer_name] = _score_to_float(score_obj)
+            score_details[scorer_name] = {
+                "label": str(score_obj.value) if score_obj.value is not None else None,
+                "explanation": score_obj.explanation,
+                "answer": score_obj.answer,
+            }
 
         latency_ms: float = 0.0
         if sample.total_time is not None:
@@ -101,6 +128,8 @@ class OpenTelemetryLogger(Hooks):
             model_name = next(iter(sample.model_usage.keys()), None)
 
         output_text = _extract_output_text(sample.output)
+        finish_reason = _extract_finish_reason(sample.output)
+        messages = _extract_messages(sample.messages)
 
         self._manager.log_sample(
             run_id=data.eval_id,
@@ -109,16 +138,24 @@ class OpenTelemetryLogger(Hooks):
             outputs={"output": output_text},
             expected={"target": str(sample.target)},
             scores=scores,
+            score_details=score_details,
+            messages=messages,
             metadata={
                 "llm.latency_ms": latency_ms,
                 "llm.model": model_name,
             },
+            finish_reason=finish_reason,
+            epoch=sample.epoch,
         )
 
     async def on_eval_set_end(self, data: EvalSetEnd) -> None:  # type: ignore[override]
         """Gracefully shut down all backends when the eval set finishes."""
         self._manager.shutdown()
 
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
 
 # Categorical score values used by Inspect AI's built-in scorers.
 _CATEGORICAL_SCORES: dict[str, float] = {"C": 1.0, "I": 0.0, "P": 0.5}
@@ -142,3 +179,28 @@ def _extract_output_text(output: Any) -> str:
     if isinstance(completion, str) and completion:
         return completion
     return str(output)
+
+
+def _extract_finish_reason(output: Any) -> str | None:
+    """Extract the stop/finish reason from a ModelOutput."""
+    choices = getattr(output, "choices", None)
+    if choices:
+        return getattr(choices[0], "stop_reason", None)
+    return None
+
+
+def _extract_messages(chat_messages: list[Any]) -> list[dict[str, str]]:
+    """Convert Inspect AI ChatMessage list to simple role/content dicts."""
+    result: list[dict[str, str]] = []
+    for msg in chat_messages:
+        content = msg.content
+        if isinstance(content, list):
+            # Content parts — join text parts into a single string.
+            text = " ".join(
+                p.text if hasattr(p, "text") else str(p)
+                for p in content
+            )
+        else:
+            text = str(content) if content is not None else ""
+        result.append({"role": str(msg.role), "content": text})
+    return result
