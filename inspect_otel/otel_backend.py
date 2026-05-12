@@ -19,6 +19,20 @@ from opentelemetry.trace import StatusCode
 _TRACER_NAME = "inspect-otel"
 _SERVICE_NAME_ATTR = "service.name"
 
+# Map provider prefixes (e.g. "openai/gpt-4o") to OpenInference llm.system values.
+_LLM_SYSTEM_MAP: dict[str, str] = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "bedrock": "aws_bedrock",
+    "google": "google",
+    "mistral": "mistral_ai",
+    "groq": "groq",
+    "together": "together",
+    "cohere": "cohere",
+    "ollama": "ollama",
+    "vllm": "vllm",
+}
+
 # OpenInference semantic convention keys understood by Arize Phoenix
 _SPAN_KIND = "openinference.span.kind"
 _INPUT_VALUE = "input.value"
@@ -76,6 +90,8 @@ class OpenTelemetryBackend:
         self._run_spans: dict[str, trace.Span] = {}
         # Keyed by (eval_id, sample_id); stores open inspect.sample spans.
         self._sample_spans: dict[tuple[str, str], trace.Span] = {}
+        # Keyed by (eval_id, sample_id); stores open inspect.scoring spans.
+        self._scoring_spans: dict[tuple[str, str], trace.Span] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -89,7 +105,7 @@ class OpenTelemetryBackend:
         span.set_attribute(_SESSION_ID, run_id)
         for key, value in metadata.items():
             if value is not None:
-                span.set_attribute(key, str(value))
+                _set_attribute(span, key, value)
         with self._lock:
             self._run_spans[run_id] = span
 
@@ -148,6 +164,9 @@ class OpenTelemetryBackend:
         with self._tracer.start_as_current_span("llm.call", context=parent_ctx) as span:
             span.set_attribute(_SPAN_KIND, "LLM")
             span.set_attribute(_LLM_MODEL_NAME, model_name)
+            llm_system = _infer_llm_system(model_name)
+            if llm_system:
+                span.set_attribute("llm.system", llm_system)
             span.set_attribute(_LLM_PROMPT_TOKENS, input_tokens)
             span.set_attribute(_LLM_COMPLETION_TOKENS, output_tokens)
             span.set_attribute(_LLM_TOTAL_TOKENS, total_tokens)
@@ -227,6 +246,11 @@ class OpenTelemetryBackend:
         with self._lock:
             span = self._sample_spans.pop((run_id, sample_id), None)
             run_span = self._run_spans.get(run_id)
+            scoring_span = self._scoring_spans.pop((run_id, sample_id), None)
+
+        # Close the scoring span now — it covers everything from on_sample_scoring to here.
+        if scoring_span is not None:
+            scoring_span.end()
 
         # Determine a representative float score (first non-None entry).
         score: float | None = next(
@@ -321,12 +345,37 @@ class OpenTelemetryBackend:
 
         span.end()
 
+    def start_scoring_span(self, run_id: str, sample_id: str) -> None:
+        """Open an ``inspect.scoring`` child span nested under the sample span."""
+        with self._lock:
+            sample_span = self._sample_spans.get((run_id, sample_id))
+        if sample_span is None:
+            return
+        parent_ctx = trace.set_span_in_context(sample_span)
+        span = self._tracer.start_span("inspect.scoring", context=parent_ctx)
+        span.set_attribute(_SPAN_KIND, "CHAIN")
+        span.set_attribute(_SESSION_ID, run_id)
+        span.set_attribute("eval.sample_id", sample_id)
+        with self._lock:
+            self._scoring_spans[(run_id, sample_id)] = span
+
     def log_run_summary(self, run_id: str, log: Any) -> None:
-        """Write aggregate metrics from TaskEnd.log onto the open run span."""
+        """Write aggregate metrics and status from TaskEnd.log onto the open run span."""
         with self._lock:
             span = self._run_spans.get(run_id)
         if span is None:
             return
+
+        # Run-level status ("success", "error", "cancelled").
+        status_str = str(getattr(log, "status", None) or "")
+        if status_str:
+            span.set_attribute("eval.status", status_str)
+            if status_str == "success":
+                span.set_status(StatusCode.OK)
+            else:
+                error = getattr(log, "error", None)
+                error_msg = getattr(error, "message", status_str) if error else status_str
+                span.set_status(StatusCode.ERROR, error_msg)
 
         results = getattr(log, "results", None)
         if results is not None:
@@ -420,6 +469,22 @@ class OpenTelemetryBackend:
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _infer_llm_system(model_name: str) -> str | None:
+    """Return the OpenInference llm.system value for a provider-prefixed model name."""
+    if "/" in model_name:
+        provider = model_name.split("/")[0].lower()
+        return _LLM_SYSTEM_MAP.get(provider, provider)
+    return None
+
+
+def _set_attribute(span: trace.Span, key: str, value: Any) -> None:
+    """Set a span attribute, preserving list types for OTel sequence attributes."""
+    if isinstance(value, (list, tuple)):
+        span.set_attribute(key, list(value))
+    else:
+        span.set_attribute(key, str(value))
+
 
 def _set_prefixed_attributes(
     span: trace.Span, prefix: str, data: dict[str, Any]

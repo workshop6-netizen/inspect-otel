@@ -11,6 +11,7 @@ from inspect_ai.hooks import (
     ModelCacheUsageData,
     ModelUsageData,
     SampleEnd,
+    SampleScoring,
     SampleStart,
     TaskEnd,
     TaskStart,
@@ -59,14 +60,45 @@ class OpenTelemetryLogger(Hooks):
             metadata["eval.dataset.version"] = str(dataset.version)
         if spec.tags:
             metadata["eval.tags"] = ",".join(spec.tags)
+            metadata["tag.tags"] = list(spec.tags)  # list — Phoenix filter bar
         if spec.metadata:
             experiment_id = spec.metadata.get("experiment_id")
             if experiment_id is not None:
                 metadata["eval.experiment_id"] = str(experiment_id)
 
-        # Extract GenerateConfig so Phoenix can render the Parameters panel.
-        config = getattr(spec, "config", None)
-        self._current_invocation_params = _extract_invocation_params(config)
+        # EvalConfig: epochs and limits.
+        eval_config = getattr(spec, "config", None)
+        epochs = getattr(eval_config, "epochs", None)
+        if epochs is not None:
+            metadata["eval.epochs"] = epochs
+
+        # Solver and scorer names.
+        if spec.solver:
+            metadata["eval.solver"] = spec.solver
+        scorers = getattr(spec, "scorers", None)
+        if scorers:
+            metadata["eval.scorers"] = ",".join(
+                s.name for s in scorers if getattr(s, "name", None)
+            )
+
+        # Git revision for reproducibility.
+        revision = getattr(spec, "revision", None)
+        if revision:
+            if getattr(revision, "origin", None):
+                metadata["eval.revision.origin"] = revision.origin
+            if getattr(revision, "commit", None):
+                metadata["eval.revision.commit"] = revision.commit
+            if getattr(revision, "dirty", None) is not None:
+                metadata["eval.revision.dirty"] = str(revision.dirty)
+
+        # Package versions (key deps for reproducibility).
+        packages = getattr(spec, "packages", None)
+        if packages:
+            metadata["eval.packages"] = json.dumps(packages)
+
+        # GenerateConfig (model_generate_config) for the Parameters panel.
+        gen_config = getattr(spec, "model_generate_config", None)
+        self._current_invocation_params = _extract_invocation_params(gen_config)
         if self._current_invocation_params:
             metadata["llm.invocation_parameters"] = json.dumps(self._current_invocation_params)
 
@@ -107,6 +139,13 @@ class OpenTelemetryLogger(Hooks):
             model_name=data.model_name,
             cache_read_tokens=usage.input_tokens_cache_read or usage.input_tokens,
             total_tokens=usage.total_tokens,
+        )
+
+    async def on_sample_scoring(self, data: SampleScoring) -> None:  # type: ignore[override]
+        """Open an ``inspect.scoring`` child span to demarcate solver vs. scorer time."""
+        self._manager.start_scoring_span(
+            run_id=data.eval_id,
+            sample_id=data.sample_id,
         )
 
     async def on_task_end(self, data: TaskEnd) -> None:  # type: ignore[override]

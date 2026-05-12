@@ -87,6 +87,11 @@ class TelemetryManager:
                 tool_input=tool_input,
             )
 
+    def start_scoring_span(self, run_id: str, sample_id: str) -> None:
+        """Open an ``inspect.scoring`` child span in all backends."""
+        for backend in self._backends:
+            backend.start_scoring_span(run_id, sample_id)
+
     def log_run_summary(self, run_id: str, log: Any) -> None:
         """Write aggregate metrics from TaskEnd.log to the run span in all backends."""
         for backend in self._backends:
