@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import threading
 from typing import Any
 
@@ -17,6 +18,15 @@ from opentelemetry.trace import StatusCode
 
 _TRACER_NAME = "inspect-otel"
 _SERVICE_NAME_ATTR = "service.name"
+
+# OpenInference semantic convention keys understood by Arize Phoenix
+_SPAN_KIND = "openinference.span.kind"
+_INPUT_VALUE = "input.value"
+_OUTPUT_VALUE = "output.value"
+_LLM_MODEL_NAME = "llm.model_name"
+_LLM_PROMPT_TOKENS = "llm.token_count.prompt"
+_LLM_COMPLETION_TOKENS = "llm.token_count.completion"
+_LLM_TOTAL_TOKENS = "llm.token_count.total"
 
 # ContextVar that carries the current OTel context across async boundaries.
 # Each asyncio task (sample) runs in its own copy of the context, so setting
@@ -70,6 +80,7 @@ class OpenTelemetryBackend:
     def start_run(self, run_id: str, metadata: dict[str, Any]) -> None:
         """Open a root span for an eval run."""
         span = self._tracer.start_span("inspect.run")
+        span.set_attribute(_SPAN_KIND, "CHAIN")
         for key, value in metadata.items():
             if value is not None:
                 span.set_attribute(key, str(value))
@@ -92,6 +103,7 @@ class OpenTelemetryBackend:
 
         parent_ctx = trace.set_span_in_context(run_span)
         span = self._tracer.start_span("inspect.sample", context=parent_ctx)
+        span.set_attribute(_SPAN_KIND, "CHAIN")
         span.set_attribute("eval.sample_id", sample_id)
         for key, value in metadata.items():
             if value is not None:
@@ -116,12 +128,7 @@ class OpenTelemetryBackend:
         latency_ms: float,
         retries: int,
     ) -> None:
-        """Emit an ``llm.call`` child span with token counts and latency.
-
-        If a sample-level span is active in the current context (set by
-        :meth:`start_sample`), the ``llm.call`` span is nested under it.
-        Otherwise it falls back to the run span.
-        """
+        """Emit an ``llm.call`` child span with token counts and latency."""
         parent_ctx = _current_otel_ctx.get()
         if parent_ctx is None:
             with self._lock:
@@ -131,10 +138,11 @@ class OpenTelemetryBackend:
             parent_ctx = trace.set_span_in_context(run_span)
 
         with self._tracer.start_as_current_span("llm.call", context=parent_ctx) as span:
-            span.set_attribute("llm.model", model_name)
-            span.set_attribute("llm.input_tokens", input_tokens)
-            span.set_attribute("llm.output_tokens", output_tokens)
-            span.set_attribute("llm.total_tokens", total_tokens)
+            span.set_attribute(_SPAN_KIND, "LLM")
+            span.set_attribute(_LLM_MODEL_NAME, model_name)
+            span.set_attribute(_LLM_PROMPT_TOKENS, input_tokens)
+            span.set_attribute(_LLM_COMPLETION_TOKENS, output_tokens)
+            span.set_attribute(_LLM_TOTAL_TOKENS, total_tokens)
             span.set_attribute("llm.latency_ms", latency_ms)
             if retries:
                 span.set_attribute("llm.retries", retries)
@@ -158,10 +166,9 @@ class OpenTelemetryBackend:
             parent_ctx = trace.set_span_in_context(sample_span)
 
         with self._tracer.start_as_current_span("tool.call", context=parent_ctx) as span:
+            span.set_attribute(_SPAN_KIND, "TOOL")
             span.set_attribute("tool.name", tool_name)
-            for key, value in tool_input.items():
-                if value is not None:
-                    span.set_attribute(f"tool.input.{key}", str(value))
+            span.set_attribute(_INPUT_VALUE, json.dumps(tool_input))
 
     def log_sample(
         self,
@@ -199,20 +206,32 @@ class OpenTelemetryBackend:
                 return
             parent_ctx = trace.set_span_in_context(run_span)
             span = self._tracer.start_span("inspect.sample", context=parent_ctx)
+            span.set_attribute(_SPAN_KIND, "CHAIN")
             span.set_attribute("eval.sample_id", str(sample_id))
 
+        # Phoenix renders input.value / output.value as the primary I/O display.
+        input_text = next(iter(inputs.values()), None)
+        output_text = next(iter(outputs.values()), None)
+        if input_text is not None:
+            span.set_attribute(_INPUT_VALUE, str(input_text))
+        if output_text is not None:
+            span.set_attribute(_OUTPUT_VALUE, str(output_text))
+
+        # Keep full dicts as structured attributes for completeness.
         _set_prefixed_attributes(span, "eval.input", inputs)
         _set_prefixed_attributes(span, "eval.output", outputs)
         _set_prefixed_attributes(span, "eval.expected", expected)
+
         for metric, value in scores.items():
             if value is not None:
                 span.set_attribute(f"eval.score.{metric}", float(value))
-        # Convenience: first score under the legacy key for backwards compat.
         if score is not None:
             span.set_attribute("eval.score", float(score))
+
         for key, value in metadata.items():
             if value is not None:
                 span.set_attribute(key, str(value))
+
         if passed:
             span.set_status(StatusCode.OK)
         elif score is not None:
