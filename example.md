@@ -33,7 +33,7 @@ pip install arize-phoenix
 Open a **separate terminal** and run:
 
 ```bash
-python -m phoenix.server.main
+phoenix serve
 ```
 
 Phoenix starts two services:
