@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from inspect_ai.event._tool import ToolEvent
 from inspect_ai.hooks import (
     EvalSetEnd,
     Hooks,
     ModelUsageData,
     SampleEnd,
-    SampleEvent,
     SampleStart,
     TaskEnd,
     TaskStart,
@@ -84,19 +82,6 @@ class OpenTelemetryLogger(Hooks):
             total_tokens=usage.total_tokens,
             latency_ms=data.call_duration * 1000.0,
             retries=data.retries,
-        )
-
-    async def on_sample_event(self, data: SampleEvent) -> None:  # type: ignore[override]
-        """Emit a ``tool.call`` child span for every :class:`~inspect_ai.event.ToolEvent`."""
-        if not isinstance(data.event, ToolEvent):
-            return
-        event = data.event
-        self._manager.log_tool_event(
-            run_id=data.run_id,
-            eval_id=data.eval_id,
-            sample_id=data.sample_id,
-            tool_name=event.function,
-            tool_input=event.arguments,
         )
 
     async def on_task_end(self, data: TaskEnd) -> None:  # type: ignore[override]
