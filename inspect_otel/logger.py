@@ -90,10 +90,7 @@ class OpenTelemetryLogger(Hooks):
 
         scores: dict[str, float | None] = {}
         for scorer_name, score_obj in (sample.scores or {}).items():
-            try:
-                scores[scorer_name] = score_obj.as_float()
-            except (TypeError, ValueError):
-                scores[scorer_name] = None
+            scores[scorer_name] = _score_to_float(score_obj)
 
         latency_ms: float = 0.0
         if sample.total_time is not None:
@@ -103,11 +100,13 @@ class OpenTelemetryLogger(Hooks):
         if sample.model_usage:
             model_name = next(iter(sample.model_usage.keys()), None)
 
+        output_text = _extract_output_text(sample.output)
+
         self._manager.log_sample(
             run_id=data.eval_id,
             sample_id=data.sample_id,
             inputs={"input": str(sample.input)},
-            outputs={"output": str(sample.output)},
+            outputs={"output": output_text},
             expected={"target": str(sample.target)},
             scores=scores,
             metadata={
@@ -119,3 +118,27 @@ class OpenTelemetryLogger(Hooks):
     async def on_eval_set_end(self, data: EvalSetEnd) -> None:  # type: ignore[override]
         """Gracefully shut down all backends when the eval set finishes."""
         self._manager.shutdown()
+
+
+# Categorical score values used by Inspect AI's built-in scorers.
+_CATEGORICAL_SCORES: dict[str, float] = {"C": 1.0, "I": 0.0, "P": 0.5}
+
+
+def _score_to_float(score_obj: Any) -> float | None:
+    """Convert an Inspect AI Score to a float, handling categorical values."""
+    try:
+        return score_obj.as_float()
+    except (TypeError, ValueError):
+        pass
+    val = score_obj.value
+    if isinstance(val, str):
+        return _CATEGORICAL_SCORES.get(val.upper())
+    return None
+
+
+def _extract_output_text(output: Any) -> str:
+    """Extract the completion text from a ModelOutput or return str(output)."""
+    completion = getattr(output, "completion", None)
+    if isinstance(completion, str) and completion:
+        return completion
+    return str(output)
